@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Particle Sphere</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  #fps { position: fixed; top: 10px; left: 12px; font: 12px/1.3 ui-monospace, Menlo, monospace; color: #9fb4ff; background: rgba(0,0,0,.45); padding: 4px 8px; border-radius: 6px; pointer-events: none; z-index: 10; }
+  #fps.warn { color: #ffd166; } #fps.bad { color: #ff6b6b; }
+  #hint { position: fixed; left: 50%; top: 12px; transform: translateX(-50%); font: 12px system-ui, sans-serif; color: rgba(200,210,255,.55); pointer-events: none; z-index: 10; }
+  #controls { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; gap: 10px; z-index: 10; flex-wrap: wrap; justify-content: center; padding: 0 12px; }
+  #controls { gap: 12px; align-items: stretch; }
+  #controls .card { display: flex; flex-direction: column; gap: 7px; padding: 10px 12px; border-radius: 14px; background: rgba(20,22,40,.72); border: 1px solid rgba(255,255,255,.14); backdrop-filter: blur(6px); }
+  #controls .title { font: 600 12px/1 system-ui, -apple-system, Segoe UI, sans-serif; color: #cfd6ff; display: flex; align-items: center; gap: 7px; }
+  #controls .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  #controls .row { display: flex; align-items: center; gap: 8px; font: 12px system-ui, sans-serif; color: #c9cfee; }
+  #controls .lab { width: 34px; }
+  #controls .val { width: 38px; text-align: right; font: 600 12px ui-monospace, Menlo, monospace; }
+  #controls .val.pos { color: #8fb0ff; } #controls .val.neg { color: #ff9a9a; } #controls .val.zero { color: #8a90a8; }
+  #controls input[type=range] { width: 150px; height: 18px; margin: 0; background: transparent; cursor: pointer; -webkit-appearance: none; appearance: none; }
+  #controls input[type=range]::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: linear-gradient(90deg, rgba(255,90,90,.75), rgba(120,125,150,.35) 50%, rgba(90,140,255,.8)); }
+  #controls input[type=range]::-moz-range-track { height: 6px; border-radius: 3px; background: linear-gradient(90deg, rgba(255,90,90,.75), rgba(120,125,150,.35) 50%, rgba(90,140,255,.8)); }
+  #controls input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; margin-top: -4px; border-radius: 50%; background: #fff; border: 2px solid #4a5cff; }
+  #controls input[type=range]::-moz-range-thumb { width: 10px; height: 10px; border-radius: 50%; background: #fff; border: 2px solid #4a5cff; }
+  #controls .card.dragging { border-color: rgba(255,200,120,.85); box-shadow: 0 0 14px rgba(255,170,80,.45); }
+  #controls .card.dragging::after { content: 'гравітація вимкнена, поки ви тягнете'; font: 11px system-ui, sans-serif; color: #ffd9a0; }
+  #camBtn { position: fixed; right: 14px; top: 12px; z-index: 10; font: 600 13px system-ui, sans-serif; color: #e8ecff; background: rgba(20,22,40,.72); border: 1px solid rgba(255,255,255,.2); border-radius: 999px; padding: 9px 16px; cursor: pointer; backdrop-filter: blur(6px); }
+  #faceBtn { position: fixed; right: 14px; top: 54px; z-index: 10; font: 600 12px system-ui, sans-serif; color: #e8ecff; background: rgba(20,22,40,.72); border: 1px solid rgba(255,255,255,.2); border-radius: 999px; padding: 7px 14px; cursor: pointer; backdrop-filter: blur(6px); }
+  #modeBtn { position: fixed; right: 14px; top: 90px; z-index: 10; font: 600 12px system-ui, sans-serif; color: #e8ecff; background: rgba(20,22,40,.72); border: 1px solid rgba(255,255,255,.2); border-radius: 999px; padding: 7px 14px; cursor: pointer; backdrop-filter: blur(6px); }
+  #modeBtn:hover { filter: brightness(1.25); }
+  #clockBtn { position: fixed; right: 14px; top: 128px; z-index: 10; font: 600 12px system-ui, sans-serif; color: #e8ecff; background: rgba(20,22,40,.72); border: 1px solid rgba(255,255,255,.2); border-radius: 999px; padding: 7px 14px; cursor: pointer; backdrop-filter: blur(6px); }
+  #clockBtn:hover { filter: brightness(1.25); }
+  #clockBtn.on { border-color: rgba(120,200,255,.7); color: #cfeaff; }
+  #faceBtn:hover { filter: brightness(1.25); }
+  #camBtn:hover { filter: brightness(1.25); }
+  #camBtn.on { border-color: rgba(120,255,170,.7); color: #c8ffd9; }
+  #camMsg { position: fixed; left: 50%; top: 46px; transform: translateX(-50%); z-index: 11; max-width: 80vw; text-align: center; font: 13px system-ui, sans-serif; color: #ffd9a0; background: rgba(20,22,40,.8); padding: 8px 14px; border-radius: 10px; opacity: 0; transition: opacity .3s; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="fps">-- FPS</div>
+<div id="hint" class="ui">Перетягуйте планети мишею</div>
+<button id="camBtn" class="ui" type="button">Камера: малювати мене</button>
+<button id="faceBtn" class="ui" type="button">Лише обличчя: так</button>
+<button id="modeBtn" class="ui" type="button">Режим: кольори</button>
+<button id="clockBtn" class="ui" type="button">Годинник (скрінсейвер)</button>
+<div id="camMsg"></div>
+<div id="controls" class="ui"></div>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

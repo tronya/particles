@@ -1,0 +1,4 @@
+# local snapshots made while iterating
+*.bak.js
+*.bak.html
+.DS_Store

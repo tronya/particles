@@ -263,16 +263,62 @@ const clockTex = new THREE.CanvasTexture(clockCanvas);
 clockTex.magFilter = THREE.LinearFilter; clockTex.minFilter = THREE.LinearMipmapLinearFilter; clockTex.generateMipmaps = true;   // mip levels = long-range gravity toward the digits
 const clockRectU = { value: new THREE.Vector2(20, 7.5) };   // world size of the clock mask
 const clockViewU = { value: new THREE.Vector2(12, 9) };   // half extents of the visible area (world)
+const SDF_W = 1024, SDF_H = 384;
+const clockSdfTex = new THREE.DataTexture(new Uint16Array(SDF_W * SDF_H), SDF_W, SDF_H, THREE.RedFormat, THREE.HalfFloatType);
+clockSdfTex.internalFormat = 'R16F';
+clockSdfTex.minFilter = clockSdfTex.magFilter = THREE.LinearFilter; clockSdfTex.generateMipmaps = false;
+// exact Euclidean distance transform (Felzenszwalb & Huttenlocher): squared distance to the nearest "site" (a zero in f)
+function edt2d(f, w, h) {
+  const INF = 1e20, n = Math.max(w, h);
+  const v = new Int32Array(n), z = new Float32Array(n + 1), tmp = new Float32Array(n), out = new Float32Array(n);
+  const d = new Float32Array(w * h);
+  const pass = (len) => {
+    let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (let q = 1; q < len; q++) {
+      let sx;
+      for (;;) { const p = v[k]; sx = ((tmp[q] + q * q) - (tmp[p] + p * p)) / (2 * q - 2 * p); if (sx <= z[k]) k--; else break; if (k < 0) { k = 0; break; } }
+      k++; v[k] = q; z[k] = sx; z[k + 1] = INF;
+    }
+    k = 0;
+    for (let q = 0; q < len; q++) { while (z[k + 1] < q) k++; const p = v[k]; out[q] = (q - p) * (q - p) + tmp[p]; }
+  };
+  for (let x = 0; x < w; x++) { for (let y = 0; y < h; y++) tmp[y] = f[y * w + x]; pass(h); for (let y = 0; y < h; y++) d[y * w + x] = out[y]; }
+  for (let y = 0; y < h; y++) { for (let x = 0; x < w; x++) tmp[x] = d[y * w + x]; pass(w); for (let x = 0; x < w; x++) d[y * w + x] = out[x]; }
+  return d;
+}
+// the digits are drawn solid; the signed distance field (in pixels, positive outside, negative inside) is what the particles orbit around
 function drawClock() {
-  const d = new Date(), txt = [d.getHours(), d.getMinutes()].map((n) => String(n).padStart(2, '0')).join(':');
-  const g = clockCanvas.getContext('2d');
-  g.fillStyle = '#000'; g.fillRect(0, 0, 1024, 384);
-  g.font = '700 250px Menlo, "SF Mono", ui-monospace, Consolas, monospace';
-  g.textAlign = 'center'; g.textBaseline = 'middle';
-  g.shadowColor = '#fff'; g.shadowBlur = 90; g.fillStyle = '#fff';
-  g.fillText(txt, 512, 196); g.fillText(txt, 512, 196);       // soft halo around the digits (their "gravity well")
-  g.shadowBlur = 0; g.fillText(txt, 512, 196);                // solid digits
-  clockTex.needsUpdate = true;
+  const dt = new Date(), txt = [dt.getHours(), dt.getMinutes()].map((n) => String(n).padStart(2, '0')).join(':');
+  const g = clockCanvas.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#000'; g.fillRect(0, 0, SDF_W, SDF_H);
+  const FONT = (px) => '400 ' + px + 'px Anton, Impact, "Arial Narrow", sans-serif';   // Anton (Google Fonts); Impact is the offline fallback
+  g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+  // lay the characters out one by one with a gap, so every digit is a separate body with room for its own orbit
+  const chars = [...txt], GAPF = 0.30;                      // gap = 30% of the font size
+  g.font = FONT(100);
+  const w100 = chars.map((c) => g.measureText(c).width), mm = g.measureText(txt);
+  const h100 = mm.actualBoundingBoxAscent + mm.actualBoundingBoxDescent;
+  const total100 = w100.reduce((a, b) => a + b, 0) + 100 * GAPF * (chars.length - 1);
+  const size = Math.min(240 / h100 * 100, 860 / total100 * 100);
+  g.font = FONT(size);
+  const widths = chars.map((c) => g.measureText(c).width), gap = size * GAPF;
+  const total = widths.reduce((a, b) => a + b, 0) + gap * (chars.length - 1);
+  const m1 = g.measureText(txt);
+  const yBase = SDF_H / 2 + (m1.actualBoundingBoxAscent - m1.actualBoundingBoxDescent) / 2;   // centre the glyph box vertically
+  g.fillStyle = '#fff';
+  let x = (SDF_W - total) / 2;
+  chars.forEach((c, i) => { g.fillText(c, x, yBase); x += widths[i] + gap; });
+  const px = g.getImageData(0, 0, SDF_W, SDF_H).data, N = SDF_W * SDF_H;
+  let bx0 = SDF_W, bx1 = 0, by0 = SDF_H, by1 = 0;
+  for (let y = 0; y < SDF_H; y++) for (let x = 0; x < SDF_W; x++) if (px[(y * SDF_W + x) * 4] > 127) { if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y; }
+  clockState.bbox = [bx0, by0, bx1, by1];   // glyph bounding box in canvas pixels (must stay inside 0..1023 x 0..383)
+  const toGlyph = new Float32Array(N), toBg = new Float32Array(N);
+  for (let i = 0; i < N; i++) { const inside = px[i * 4] > 127; toGlyph[i] = inside ? 0 : 1e20; toBg[i] = inside ? 1e20 : 0; }
+  const dOut = edt2d(toGlyph, SDF_W, SDF_H), dIn = edt2d(toBg, SDF_W, SDF_H);
+  const half = clockSdfTex.image.data;
+  // canvas rows go top-down, texture rows bottom-up: flip while writing
+  for (let y = 0; y < SDF_H; y++) for (let x = 0; x < SDF_W; x++) { const i = y * SDF_W + x; half[(SDF_H - 1 - y) * SDF_W + x] = THREE.DataUtils.toHalfFloat(dOut[i] > 0 ? Math.sqrt(dOut[i]) : -Math.sqrt(dIn[i])); }
+  clockSdfTex.needsUpdate = true;
   clockState.text = txt;
 }
 const shadowU = { value: 0 };   // 0 = colour matching, 1 = shadows only (the contour of the face)
@@ -287,7 +333,7 @@ const velMat = new THREE.ShaderMaterial({
     uG: { value: GRAVITY }, uRMin: { value: R_MIN }, uRMax: { value: R_MAX },
     uCen: { value: planetCenters }, uCenVel: { value: planetVels }, uScale: { value: planetScale }, uMass: { value: planetMass }, uGrav: { value: planetGrav }, uN: { value: PLANETS }, uTidal: { value: STATIC_PAIR ? 0 : PLANET_G }, uSoft: { value: SOFT }, uBoost: { value: 0.5 },
     tCam: { value: blackTex }, uCam: { value: 0 }, uCamSize: camSizeU, uFace: faceU, uShadow: shadowU,
-    tClock: { value: clockTex }, uClock: { value: 0 }, uClockRect: clockRectU, uClockView: clockViewU,
+    tSdf: { value: clockSdfTex }, uClock: { value: 0 }, uClockRect: clockRectU, uClockView: clockViewU,
     uFarK: { value: 4.0 }, uTether: { value: 0.10 }, uOwnMode: { value: ownEff }, uForMode: { value: forMode }, uRepelK: { value: REPEL_K }, uMaxR: { value: MAX_SPREAD * RADIUS }, uForRange: { value: FOREIGN_RANGE },
   },
   vertexShader: passVert,
@@ -296,7 +342,7 @@ const velMat = new THREE.ShaderMaterial({
     uniform float uTime, uDt, uR, uG, uRMin, uRMax, uTidal, uSoft, uBoost, uFarK, uRepelK, uMaxR, uForRange, uTether;
     uniform float uCam, uClock;
     uniform vec2 uClockRect, uClockView;
-    uniform sampler2D tClock;
+    uniform sampler2D tSdf;
     uniform vec2 uCamSize;
     uniform vec4 uFace;
     uniform float uShadow;
@@ -327,41 +373,55 @@ const velMat = new THREE.ShaderMaterial({
       return rotate(base, axis, t * speed);
     }
 
+    // signed distance (world units) from the digits at a world position; outside the field area the distance keeps growing
+    float dfun(vec2 wp, float k) {
+      vec2 uvm = vec2(0.5 + wp.x / uClockRect.x, 0.5 + wp.y / uClockRect.y);
+      vec2 uvc = clamp(uvm, 0.0005, 0.9995);
+      return texture2D(tSdf, uvc).r * k + length((uvm - uvc) * uClockRect);
+    }
+
+    const float ZT = 0.30;                                      // half thickness of the digits (the clock is a slab, not a picture)
+    float d3f(vec3 p, float k) {
+      float a = dfun(p.xy, k), b = abs(p.z) - ZT;
+      return length(max(vec2(a, b), 0.0)) + min(max(a, b), 0.0);
+    }
+
     void main() {
       vec4 P = texture2D(tPos, vUv);
       float g = P.w;
       vec4 V4 = texture2D(tVel, vUv);
       if (uClock > 0.5) {
-        // clock screensaver: the digits act like a planet. Far away the particles fall toward them (gravity), at a certain distance
-        // they are caught in a band around the glyph outline (attracted from outside, pushed back if they get too close),
-        // and they circulate along the outline the way particles circle a planet.
+        // clock screensaver: the digits are a body like a planet. d = distance from the digit surface (from the signed distance field).
+        // Same recipe as for the planets: gravity toward the body, orbital speed along its surface, not closer than DMIN, a soft outer wall,
+        // and only the plain far-field pull for those that are far away.
         vec2 wp = P.xy;
+        float k = uClockRect.x / 1024.0;                       // world units per pixel of the field
+        float e = 0.10;
+        float d0 = d3f(P.xyz, k);
+        vec3 gdv = vec3(d3f(P.xyz + vec3(e, 0.0, 0.0), k) - d3f(P.xyz - vec3(e, 0.0, 0.0), k),
+                        d3f(P.xyz + vec3(0.0, e, 0.0), k) - d3f(P.xyz - vec3(0.0, e, 0.0), k),
+                        d3f(P.xyz + vec3(0.0, 0.0, e), k) - d3f(P.xyz - vec3(0.0, 0.0, e), k));
+        vec3 nrm = gdv / (length(gdv) + 1e-4);                  // points away from the (thick) digits, in 3D
+        const float R0 = 0.55, DMIN = 0.14, DMAX = 1.4;
+        float r = max(d0, 0.0) + R0;
         float hsh = fract(sin(dot(vUv, vec2(12.9898, 78.233))) * 43758.5453);
-        vec2 uvm = vec2(0.5 + wp.x / uClockRect.x, 0.5 + wp.y / uClockRect.y);
-        vec2 uvc = clamp(uvm, 0.001, 0.999);
-        float m0 = texture2D(tClock, uvc).r;
-        vec2 dd = vec2(0.006, 0.006 * uClockRect.x / uClockRect.y);
-        float mx = texture2D(tClock, clamp(uvm + vec2(dd.x, 0.0), 0.001, 0.999)).r - texture2D(tClock, clamp(uvm - vec2(dd.x, 0.0), 0.001, 0.999)).r;
-        float my = texture2D(tClock, clamp(uvm + vec2(0.0, dd.y), 0.001, 0.999)).r - texture2D(tClock, clamp(uvm - vec2(0.0, dd.y), 0.001, 0.999)).r;
-        vec2 gdir = vec2(mx, my) / (length(vec2(mx, my)) + 0.02);
-        // long-range pull: gradient of a very blurred copy of the mask (mip level) points to the nearest digits; outside the mask: toward its centre
-        float lod = 5.0;
-        vec2 ec = vec2(exp2(lod) / 1024.0, exp2(lod) / 384.0);
-        float cx = textureLod(tClock, clamp(uvm + vec2(ec.x, 0.0), 0.001, 0.999), lod).r - textureLod(tClock, clamp(uvm - vec2(ec.x, 0.0), 0.001, 0.999), lod).r;
-        float cy = textureLod(tClock, clamp(uvm + vec2(0.0, ec.y), 0.001, 0.999), lod).r - textureLod(tClock, clamp(uvm - vec2(0.0, ec.y), 0.001, 0.999), lod).r;
-        vec2 gc = vec2(cx, cy);
-        vec2 toC = -wp / (uClockRect * 0.5);
-        toC /= (length(toC) + 1e-3);
-        vec2 farDir = length(gc) > 0.004 ? gc / length(gc) : toC;
-        float farW = 1.0 - smoothstep(0.0, 0.06, m0);               // gravity acts outside the halo
-        vec2 acc = farDir * 5.5 * farW;
-        acc += gdir * (0.26 - m0) * 24.0 * step(0.005, m0);          // band: attract to the 0.26 contour, repel inside
-        vec2 tdir = vec2(-gdir.y, gdir.x) * (hsh < 0.5 ? 1.0 : -1.0);
-        acc += tdir * 2.6 * smoothstep(0.02, 0.18, m0) * (1.0 - smoothstep(0.35, 0.65, m0)); // circulate along the outline
-        acc += (vec2(fract(hsh * 91.7 + uTime * 3.1), fract(hsh * 53.3 + uTime * 2.3)) - 0.5) * 1.5;
-        vec3 vel = V4.xyz;
-        vel.xy = (vel.xy + acc * uDt) * exp(-1.9 * uDt);
-        vel.z += (-(P.z - (hsh - 0.5) * 0.8) * 14.0 - vel.z * 6.0) * uDt;
+        float w = smoothstep(DMAX * 2.6, DMAX * 1.3, d0);
+        float gk = 0.55;
+        float gw = smoothstep(DMIN, DMIN + 0.30, d0);
+        vec3 acc = -nrm * (uG * gk / (r * r)) * gw;
+        acc += -nrm * (1.0 - w) * (uG * uFarK / (r * r + 1.0) + uTether);
+        acc += nrm * (400.0 * max(DMIN - d0, 0.0) + 800.0 * max(-d0, 0.0));
+        acc -= nrm * 10.0 * max(d0 - DMAX, 0.0) * w;
+        // every satellite has its own orbit plane: tangent = surface normal x a personal axis, so they pass in front of, above and behind the digits
+        vec3 ax = normalize(vec3(sin(hsh * 61.7 + 1.0), cos(hsh * 37.3 + 2.0), sin(hsh * 83.1 + 3.0)) + vec3(0.0, 0.0, 0.0001));
+        vec3 tdir = cross(nrm, ax);
+        tdir = tdir / (length(tdir) + 1e-4) * (fract(hsh * 7.31) < 0.5 ? 1.0 : -1.0);
+        vec3 v3 = V4.xyz;
+        float vt = sqrt(uG * gk / r) * (0.85 + 0.3 * hsh);
+        acc += (tdir * (vt - dot(v3, tdir))) * 2.4 * w;
+        acc -= nrm * dot(v3, nrm) * 1.6 * w;
+        acc += (vec3(fract(hsh * 91.7 + uTime * 3.1), fract(hsh * 53.3 + uTime * 2.3), fract(hsh * 17.9 + uTime * 1.7)) - 0.5) * 0.8;
+        vec3 vel = (v3 + acc * uDt) * exp(-(0.15 + 0.5 * (1.0 - w)) * uDt);
         vel.x -= (max(wp.x - uClockView.x * 0.96, 0.0) - max(-wp.x - uClockView.x * 0.96, 0.0)) * 14.0 * uDt;
         vel.y -= (max(wp.y - uClockView.y * 0.96, 0.0) - max(-wp.y - uClockView.y * 0.96, 0.0)) * 14.0 * uDt;
         float spk = length(vel);
@@ -570,11 +630,11 @@ const pointsMat = new THREE.ShaderMaterial({
     tPos: { value: null }, tVel: { value: null },
     uSize: { value: 1.5 }, uPixelRatio: { value: renderer.getPixelRatio() },
     uCen: { value: planetCenters }, uCenVel: { value: planetVels }, uScale: { value: planetScale }, uShift: { value: shift }, uCamZ: { value: 14 }, tCam: { value: blackTex }, uCamMix: { value: 0 }, uCamSize: camSizeU, uFace: faceU, uShadow: shadowU,
-    tClock: { value: clockTex }, uClockMix: { value: 0 }, uClockRect: clockRectU,
+    tSdf: { value: clockSdfTex }, uClockMix: { value: 0 }, uClockRect: clockRectU,
   },
   vertexShader: /* glsl */ `
     uniform sampler2D tPos, tVel;
-    uniform sampler2D tClock;
+    uniform sampler2D tSdf;
     uniform vec2 uClockRect;
     uniform float uClockMix;
     uniform float uSize, uPixelRatio, uCamZ, uCamMix;
@@ -630,10 +690,13 @@ const pointsMat = new THREE.ShaderMaterial({
       }
       if (uClockMix > 0.001) {
         vec2 uvc = vec2(0.5 + P.x / uClockRect.x, 0.5 + P.y / uClockRect.y);
-        float mk = texture2D(tClock, clamp(uvc, 0.001, 0.999)).r;
+        float dd2 = texture2D(tSdf, clamp(uvc, 0.0005, 0.9995)).r * (uClockRect.x / 1024.0);
+        float dz = abs(P.z) - 0.30;
+        float dd = length(max(vec2(dd2, dz), 0.0)) + min(max(dd2, dz), 0.0);
         vec3 base = groupColour(pi, gi);
-        vColor = mix(vColor, mix(base, vec3(1.0), 0.35 * smoothstep(0.1, 0.5, mk)) * 0.8, uClockMix);
-        float ca = (0.34 + 1.4 * smoothstep(0.05, 0.30, mk)) * (1.0 - smoothstep(0.50, 0.80, mk)) * (0.5 + 0.5 * clamp(sp, 0.0, 1.5));
+        float near = 1.0 - smoothstep(0.15, 2.4, dd);
+        vColor = mix(vColor, mix(base, vec3(1.0), 0.25 * near) * 0.85, uClockMix);
+        float ca = (0.30 + 1.3 * near) * smoothstep(-0.05, 0.12, dd) * (0.5 + 0.5 * clamp(sp, 0.0, 1.5));
         vAlpha = mix(vAlpha, ca, uClockMix);
       }
       gl_PointSize = max(uSize * uPixelRatio * (0.6 * uCamZ / -mv.z), 1.5 * uPixelRatio);
@@ -668,12 +731,18 @@ const prevCenter = Array.from({ length: MAX_PLANETS }, () => new THREE.Vector2()
 for (let i = 0; i < PLANETS; i++) prevCenter[i].set(planetCenters[i].x, planetCenters[i].y);
 
 // pointer -> world position on the z = 0 plane the planets live in (camera looks at the origin)
+const _ray = new THREE.Raycaster(), _inv = new THREE.Matrix4(), _o = new THREE.Vector3(), _dir = new THREE.Vector3();
 function pointerToPlane(e, out) {
+  // cast a ray through the pointer, bring it into the group's local space (it may be rotated), intersect the plane z = 0 where the planets live
   const rect = el.getBoundingClientRect();
-  const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  const ny = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
-  const t = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.position.z;
-  return out.set(nx * t * camera.aspect, ny * t);
+  const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -(((e.clientY - rect.top) / rect.height) * 2 - 1));
+  group.updateMatrixWorld(true);
+  _ray.setFromCamera(ndc, camera);
+  _inv.copy(group.matrixWorld).invert();
+  _o.copy(_ray.ray.origin).applyMatrix4(_inv);
+  _dir.copy(_ray.ray.direction).transformDirection(_inv);
+  const t = Math.abs(_dir.z) > 1e-4 ? -_o.z / _dir.z : 0;
+  return out.set(_o.x + _dir.x * t, _o.y + _dir.y * t);
 }
 const _p = new THREE.Vector2();
 function nearestPlanet(e) {
@@ -695,12 +764,16 @@ el.addEventListener('pointerdown', (e) => {
       dragOffset.set(planetCenters[dragPlanet].x - _p.x, planetCenters[dragPlanet].y - _p.y);
       el.style.cursor = 'grabbing';
       try { el.setPointerCapture(e.pointerId); } catch (_) { /* synthetic events have no active pointer */ }
+    } else {
+      // empty space: drag to rotate the view
+      dragging = true; lastX = e.clientX; lastY = e.clientY; velY = 0; el.style.cursor = 'grabbing';
+      try { el.setPointerCapture(e.pointerId); } catch (_) { /* synthetic events have no active pointer */ }
     }
     return;
   }
   dragging = true; lastX = e.clientX; lastY = e.clientY; try { el.setPointerCapture(e.pointerId); } catch (_) { /* synthetic events have no active pointer */ }
 });
-const endDrag = () => { dragging = false; if (dragPlanet >= 0) { dragPlanet = -1; el.style.cursor = 'default'; } };
+const endDrag = () => { dragging = false; dragPlanet = -1; el.style.cursor = 'default'; };
 el.addEventListener('pointerup', endDrag);
 el.addEventListener('pointercancel', endDrag);
 el.addEventListener('pointermove', (e) => {
@@ -712,6 +785,11 @@ el.addEventListener('pointermove', (e) => {
       const maxX = t * camera.aspect - 2, maxY = t - 2;
       planetCenters[dragPlanet].x = THREE.MathUtils.clamp(_p.x + dragOffset.x, -maxX, maxX);
       planetCenters[dragPlanet].y = THREE.MathUtils.clamp(_p.y + dragOffset.y, -maxY, maxY);
+    } else if (dragging) {
+      velY = (e.clientX - lastX) * 0.005;
+      yaw += velY;
+      targetTiltX = THREE.MathUtils.clamp(targetTiltX + (e.clientY - lastY) * 0.004, -1.3, 1.3);
+      lastX = e.clientX; lastY = e.clientY;
     } else if (!e.buttons) {
       el.style.cursor = nearestPlanet(e) >= 0 ? 'grab' : 'default';
     }
@@ -907,15 +985,15 @@ function updateFaceUniform(now) {
 const clockBtn = document.getElementById('clockBtn');
 function setClock(on) {
   clockState.on = on; clockState.lastSec = -1;
-  if (on) drawClock();
+  if (on) { const go = () => { clockState.lastSec = -1; drawClock(); }; go(); if (document.fonts && document.fonts.load) document.fonts.load('340px Anton', '0123456789:').then(go).catch(() => {}); }
   if (clockBtn) { clockBtn.classList.toggle('on', on); clockBtn.textContent = on ? 'Годинник: вимкнути' : 'Годинник (скрінсейвер)'; }
 }
 if (clockBtn) clockBtn.addEventListener('click', () => setClock(!clockState.on));
-addEventListener('keydown', (e) => { if (e.code === 'KeyC' && !e.metaKey && !e.ctrlKey) setClock(!clockState.on); });
+addEventListener('keydown', (e) => { if (e.code === 'KeyR' && !e.metaKey && !e.ctrlKey) { yaw = 0; velY = 0; targetTiltX = 0; roll = 0; } if (e.code === 'KeyC' && !e.metaKey && !e.ctrlKey) setClock(!clockState.on); });
 // double click = fullscreen (nice for a screensaver)
 renderer.domElement.addEventListener('dblclick', (e) => { if (dragPlanet >= 0) return; if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); });
 if (urlParams.get('clock') === '1') setClock(true);   // ?clock=1 starts as a clock screensaver
-window.__clock = () => ({ on: clockState.on, text: clockState.text, rect: clockRectU.value.toArray().map((x) => +x.toFixed(1)), view: clockViewU.value.toArray().map((x) => +x.toFixed(1)) });
+window.__clock = () => ({ on: clockState.on, text: clockState.text, bbox: clockState.bbox, rect: clockRectU.value.toArray().map((x) => +x.toFixed(1)), view: clockViewU.value.toArray().map((x) => +x.toFixed(1)) });
 const modeBtn = document.getElementById('modeBtn');
 if (modeBtn) modeBtn.addEventListener('click', () => {
   shadowU.value = shadowU.value ? 0 : 1;
@@ -1035,6 +1113,23 @@ window.__camStats = () => {
   }
   return out.map((o, i) => ({ planet: i, n: o.n, insideFace: o.inside, nearby: o.near, far: o.far, nan: o.nan, meanSpeed: +(o.speed / Math.max(1, o.n)).toFixed(2) }));
 };
+// Debug helper for the clock: are the particles really orbiting the digits? (speed along the surface vs toward/away from it)
+window.__clockStats = () => {
+  const px = new Float32Array(SIZE * SIZE * 4), vx = new Float32Array(SIZE * SIZE * 4);
+  renderer.readRenderTargetPixels(posA, 0, 0, SIZE, SIZE, px); renderer.readRenderTargetPixels(velA, 0, 0, SIZE, SIZE, vx);
+  const sdf = clockSdfTex.image.data, W = SDF_W, H = SDF_H, Wk = clockRectU.value.x, Hk = clockRectU.value.y, k = Wk / W;
+  const D = (x, y) => { const u = 0.5 + x / Wk, v = 0.5 + y / Hk; const ix = Math.min(W - 1, Math.max(0, Math.floor(u * W))), iy = Math.min(H - 1, Math.max(0, Math.floor(v * H))); return THREE.DataUtils.fromHalfFloat(sdf[iy * W + ix]) * k; };
+  let n = 0, band = 0, tang = 0, rad = 0, cw = 0, ccw = 0, minD = 1e9, maxD = 0, inside = 0, far = 0;
+  for (let i = 0; i < SIZE * SIZE; i += 7) {
+    const x = px[i * 4], y = px[i * 4 + 1]; const d = D(x, y); n++;
+    if (d < 0) inside++;
+    if (d < 0.07 || d > 1.4 * 1.5) { if (d > 1.4 * 1.5) far++; continue; }
+    const e = 0.1, gx = D(x + e, y) - D(x - e, y), gy = D(x, y + e) - D(x, y - e), gl = Math.hypot(gx, gy) || 1, nx = gx / gl, ny = gy / gl;
+    const vxp = vx[i * 4], vyp = vx[i * 4 + 1], vr = vxp * nx + vyp * ny, vt = -vxp * ny + vyp * nx;
+    band++; tang += Math.abs(vt); rad += Math.abs(vr); if (vt > 0) ccw++; else cw++; minD = Math.min(minD, d); maxD = Math.max(maxD, d);
+  }
+  return { sampled: n, inBand: band, farAway: far, insideDigits: inside, meanAlongSurface: +(tang / band).toFixed(2), meanTowardAway: +(rad / band).toFixed(2), orbitDirections: { ccw, cw }, nearestDist: +minD.toFixed(2), farthestDistInBand: +maxD.toFixed(2) };
+};
 window.__advance = (seconds) => { for (let k = 0; k < seconds * 30; k++) { simTime += 1 / 30; simStep(1 / 30); } return simTime; };
 
 renderer.setAnimationLoop(() => {
@@ -1062,7 +1157,7 @@ renderer.setAnimationLoop(() => {
   simStep(dt);
   markDragged();
   if (camState.on) { runFaceDetection(performance.now()); updateFaceUniform(performance.now()); }
-  if (clockState.on) { const sec = Math.floor(Date.now() / 1000); if (sec !== clockState.lastSec) { clockState.lastSec = sec; drawClock(); } }
+  if (clockState.on) { const minute = Math.floor(Date.now() / 60000); if (minute !== clockState.lastSec) { clockState.lastSec = minute; drawClock(); } }
   clockState.mix += ((clockState.on ? 1 : 0) - clockState.mix) * Math.min(1, dt * 2.5);
   pointsMat.uniforms.uClockMix.value = clockState.mix;
   camState.mix += (((camState.on && !clockState.on) ? 1 : 0) - camState.mix) * Math.min(1, dt * 2.5);
@@ -1079,12 +1174,10 @@ renderer.setAnimationLoop(() => {
     }
   }
   if (STATIC_PAIR) {
-    // 2D look: the camera looks straight at the pair and slowly rolls around the view axis, so the planets stay side by side
-    // (they never swing in depth). Dragging still turns the view, and it eases back to the flat 2D view when released.
+    // The view starts flat (2D). Drag on empty space to rotate it; it stays where you leave it (a little inertia). R = back to flat.
     roll += ROLL_SPEED * dt;
-    if (!dragging) { velY *= 0.9; yaw *= 0.97; targetTiltX *= 0.97; }
-    yaw += velY;
-    tiltX += (targetTiltX - tiltX) * 0.08;
+    if (!dragging) { yaw += velY; velY *= Math.pow(0.04, dt); }   // inertia fades out in about a second
+    tiltX += (targetTiltX - tiltX) * Math.min(1, dt * 10);
     group.rotation.set(tiltX, yaw, roll);
   } else {
     if (!dragging) velY += (baseSpeed - velY) * 0.03;
